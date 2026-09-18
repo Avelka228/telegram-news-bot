@@ -19,8 +19,8 @@ RSS_FEEDS = [
 
 # --- Настройка Gemini ---
 genai.configure(api_key=GOOGLE_API_KEY)
-# Используем актуальную модель, как подсказала сама ошибка
-model = genai.GenerativeModel('gemini-3.6-flash')
+# Используем стабильную модель с большим бесплатным лимитом (1500 запросов в день)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 def get_news_from_rss():
     """Собирает заголовки и ссылки из RSS-лент."""
