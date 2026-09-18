@@ -19,8 +19,8 @@ RSS_FEEDS = [
 
 # --- Настройка Gemini ---
 genai.configure(api_key=GOOGLE_API_KEY)
-# Если здесь будет ошибка 404, попробуйте заменить на 'gemini-2.0-flash' или 'gemini-2.5-flash'
-model = genai.GenerativeModel('gemini-1.5-flash-latest')
+# Используем актуальную модель
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 def get_news_from_rss():
     """Собирает заголовки и ссылки из RSS-лент."""
