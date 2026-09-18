@@ -1,7 +1,7 @@
 import os
 import feedparser
 import requests
-import google.generativeai as genai
+from google import genai
 from datetime import datetime
 
 # --- Конфигурация ---
@@ -17,10 +17,10 @@ RSS_FEEDS = [
     "https://habr.com/ru/rss/news/all/",
 ]
 
-# --- Настройка Gemini ---
-genai.configure(api_key=GOOGLE_API_KEY)
-# Используем стабильную модель с большим бесплатным лимитом (1500 запросов в день)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# --- Настройка Gemini (новый SDK) ---
+client = genai.Client(api_key=GOOGLE_API_KEY)
+# Используем именно ту модель, которую вы просили
+MODEL_ID = "gemini-2.5-flash-lite"
 
 def get_news_from_rss():
     """Собирает заголовки и ссылки из RSS-лент."""
@@ -51,7 +51,10 @@ def process_with_ai(news_content):
     {news_content}
     """
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=prompt,
+        )
         return response.text
     except Exception as e:
         print(f"Ошибка при обращении к Gemini: {e}")
