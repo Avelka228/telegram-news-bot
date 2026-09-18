@@ -22,9 +22,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: processed_posts.json
-          key: processed-posts-${{ github.run_id }}
+          key: processed-posts-v2-${{ github.run_id }}
           restore-keys: |
-            processed-posts-
+            processed-posts-v2-
 
       - name: Install dependencies
         run: |
