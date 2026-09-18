@@ -3,6 +3,8 @@ import requests
 import hashlib
 import re
 import json
+import time
+import random
 from bs4 import BeautifulSoup
 from google import genai
 from datetime import datetime
@@ -41,7 +43,7 @@ def get_hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 def parse_channel(channel_key):
-    """Парсит веб-версию канала и возвращает список постов."""
+    """Парсит веб-версию канала и возвращает 5 последних постов с ссылками внутри текста."""
     url = f"https://t.me/s/{channel_key}"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
     
@@ -57,10 +59,23 @@ def parse_channel(channel_key):
     
     message_divs = soup.select("div.tgme_widget_message_wrap")
     
-    for msg in message_divs:
+    # Берём только последние 5 постов
+    for msg in message_divs[-5:]:
         text_el = msg.select_one(".tgme_widget_message_text")
-        text = text_el.get_text(" ", strip=True) if text_el else ""
+        if not text_el:
+            continue
         
+        # Получаем чистый текст БЕЗ ссылок для дедупликации
+        text_plain = text_el.get_text(" ", strip=True)
+        
+        # Извлекаем все ссылки из поста (кроме внутренних t.me)
+        external_links = []
+        for a in text_el.find_all("a", href=True):
+            href = a["href"]
+            if "t.me" not in href and "telegram.me" not in href:
+                external_links.append({"url": href, "anchor": a.get_text(strip=True)})
+        
+        # Картинка
         img_el = msg.select_one(".tgme_widget_message_photo_wrap")
         img_url = None
         if img_el:
@@ -72,12 +87,12 @@ def parse_channel(channel_key):
         post_link_el = msg.select_one("a.tgme_widget_message_date")
         post_link = post_link_el["href"] if post_link_el else None
         
-        if text and post_link:
+        if text_plain and post_link:
             posts.append({
-                "text": text,
+                "text": text_plain,
+                "external_links": external_links,
                 "image_url": img_url,
                 "link": post_link,
-                "channel_key": channel_key,
                 "channel_name": CHANNELS[channel_key]["name"],
             })
     
@@ -90,7 +105,7 @@ def get_all_new_posts():
     for channel_key in CHANNELS.keys():
         print(f"Парсим канал: {CHANNELS[channel_key]['name']}")
         posts = parse_channel(channel_key)
-        print(f"  Найдено постов: {len(posts)}")
+        print(f"  Найдено постов (последние 5): {len(posts)}")
         for post in posts:
             text_hash = get_hash(post["text"])
             if text_hash not in processed:
@@ -109,41 +124,52 @@ def process_with_ai(posts):
         content_for_ai += f"--- ПОСТ {i+1} ---\n"
         content_for_ai += f"Канал: {post['channel_name']}\n"
         content_for_ai += f"Текст: {post['text'][:800]}\n"
+        if post['external_links']:
+            content_for_ai += "Внешние ссылки в посте:\n"
+            for link in post['external_links']:
+                content_for_ai += f"  - URL: {link['url']} (текст ссылки: '{link['anchor']}')\n"
         content_for_ai += f"Есть картинка: {'да' if post['image_url'] else 'нет'}\n\n"
     
     prompt = f"""
     Ты — редактор технологического Telegram-канала для русскоязычной аудитории. 
-    Твой стиль: живой, но без кликбейта, с лёгкой иронией. Аудитория — гики и интересующиеся технологиями.
+    Твой стиль — как у лучших каналов про гаджеты и технологии (Wylsacom, Rozetked, Big Geek):
+    живой, увлекательный, но без кликбейта, КАПСА и жёлтых заголовков.
 
-    Ниже список постов из разных Telegram-каналов. 
-    Твоя задача: выбрать РОВНО ОДИН самый интересный, важный или трендовый пост (новость).
+    Ниже список постов из нескольких Telegram-каналов.
 
-    ВАЖНО: НЕ пиши сам ссылку. Вместо этого используй плейсхолдер {{LINK}}, куда потом подставится ссылка на первоисточник.
-    Например, если новость про Apple из канала Wylsacom, напиши: 
-    "Подробности читай <a href='{{LINK}}'>в канале Wylsacom</a>."
+    ЭТАП 1 — ОТБОР:
+    Отбрось посты, которые НЕ подходят для публикации:
+    - Личные посты: автор делится своим мнением, личными фото, личным видео, личным опытом использования.
+    - Рекламные и спонсорские посты, промокоды, интеграции.
+    - Опросы, мемы без новостной ценности, поздравления, посты "просто поболтать".
+    
+    ЭТАП 2 — ВЫБОР:
+    Из оставшихся выбери РОВНО ОДИН самый интересный, свежий и значимый для аудитории.
+    Правило: если один пост с картинкой, но скучный, а другой без картинки, но интересный — выбирай интересный.
 
-    Требования к финальному посту:
+    ЭТАП 3 — НАПИСАНИЕ ПОСТА:
     1. Объём: 3-5 абзацев, до 700 символов.
-    2. Стиль: как у Wylsacom, Rozetked, Big Geek — живо, но по делу.
-    3. Оформление: HTML-теги <b>жирный</b> для акцентов (2-3 раза).
-    4. Ссылка: обязательно вставь {{LINK}} внутри текста, обёрнутый в HTML-гиперссылку.
-    5. НЕ используй Markdown. Только HTML.
-    6. В конце поста добавь 2-3 хештега на русском.
+    2. Стиль: живо, увлекательно, как рассказывает друг. Без кликбейта и без "шок-контента".
+    3. Оформление: <b>жирный</b> для ключевого акцента (1-2 раза максимум).
+    4. ХЕШТЕГИ НЕ ДОБАВЛЯЙ ВООБЩЕ.
+    5. НЕ пиши "источник: X", "подробнее на канале Y", "читайте на сайте Z". Мы сами источник информации.
+    6. ЕСЛИ в исходном посте есть внешняя ссылка на первоисточник (Apple, Google, известный инсайдер, официальный блог) — можешь вставить её как HTML-гиперссылку ВНУТРИ слова.
+       Пример: <a href="https://apple.com">Apple</a> представила новый чип M5.
+       Если внешней ссылки на первоисточник нет — НЕ добавляй никаких ссылок.
+    7. Никакого Markdown. Только HTML.
 
-    Верни ответ строго в формате JSON с полями:
-    - "post_text": готовый текст поста (с HTML-тегами, включая {{LINK}})
-    - "post_index": номер выбранного поста (от 1 до {len(posts)})
-
-    Пример ответа:
+    Верни ответ строго в формате JSON:
     {{
-      "post_text": "<b>Apple показала новый iPhone</b>\\nСмартфон получил обновлённый дизайн и чип A20. Главная фишка — камера, которая снимает в 8K. Подробности читай <a href='{{LINK}}'>в канале Wylsacom</a>.\\n#Apple #iPhone",
-      "post_index": 3
+      "post_text": "<b>Заголовок или первое предложение</b>\\n\\nОсновной текст поста без хештегов и без упоминания источника.",
+      "post_index": номер_выбранного_поста_от_1_до_{len(posts)},
+      "reason": "кратко почему выбрал именно этот пост"
     }}
 
     Вот посты:
     {content_for_ai}
     """
     
+    response = None
     try:
         response = client.models.generate_content(
             model=MODEL_ID,
@@ -156,10 +182,11 @@ def process_with_ai(posts):
                 text = text[4:]
         text = text.strip()
         result = json.loads(text)
+        print(f"AI выбрал пост #{result.get('post_index')}: {result.get('reason', '')}")
         return result
     except Exception as e:
         print(f"Ошибка при обращении к Gemini: {e}")
-        print(f"Сырой ответ: {response.text if 'response' in locals() else 'нет'}")
+        print(f"Сырой ответ: {response.text if response is not None else 'нет'}")
         return None
 
 def publish_to_telegram(post_data, all_posts):
@@ -173,23 +200,19 @@ def publish_to_telegram(post_data, all_posts):
     
     if 0 <= post_index < len(all_posts):
         chosen_post = all_posts[post_index]
-        text = text.replace("{LINK}", chosen_post["link"])
         image_url = chosen_post.get("image_url")
         print(f"Выбранный пост: {chosen_post['channel_name']}, картинка: {'есть' if image_url else 'нет'}")
     else:
         print(f"Индекс {post_index} вне диапазона")
-        text = text.replace("{LINK}", "")
         image_url = None
     
     response = None
     try:
         if image_url:
-            # Скачиваем картинку сами, чтобы Telegram не капризничал
             print(f"Скачиваем картинку: {image_url}")
             img_response = requests.get(image_url, timeout=30)
             img_response.raise_for_status()
             
-            # Отправляем как обычное фото (sendPhoto)
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
             files = {"photo": ("image.jpg", img_response.content)}
             data = {
@@ -218,6 +241,11 @@ def publish_to_telegram(post_data, all_posts):
 
 if __name__ == "__main__":
     print(f"Запуск бота: {datetime.now()}")
+    
+    # Случайная задержка до 5 минут, чтобы посты выходили не ровно в :00
+    delay = random.randint(0, 300)
+    print(f"Случайная задержка: {delay} секунд")
+    time.sleep(delay)
     
     new_posts, processed = get_all_new_posts()
     print(f"Найдено новых постов: {len(new_posts)}")
