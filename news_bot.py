@@ -19,8 +19,8 @@ RSS_FEEDS = [
 
 # --- Настройка Gemini ---
 genai.configure(api_key=GOOGLE_API_KEY)
-# Используем актуальную модель
-model = genai.GenerativeModel('gemini-2.5-flash')
+# Используем актуальную модель, как подсказала сама ошибка
+model = genai.GenerativeModel('gemini-3.6-flash')
 
 def get_news_from_rss():
     """Собирает заголовки и ссылки из RSS-лент."""
