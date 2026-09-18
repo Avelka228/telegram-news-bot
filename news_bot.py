@@ -43,7 +43,7 @@ def get_hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 def parse_channel(channel_key):
-    """Парсит веб-версию канала и возвращает 5 последних постов с ссылками внутри текста."""
+    """Парсит веб-версию канала и возвращает 5 последних постов."""
     url = f"https://t.me/s/{channel_key}"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
     
@@ -83,6 +83,9 @@ def parse_channel(channel_key):
         post_link_el = msg.select_one("a.tgme_widget_message_date")
         post_link = post_link_el["href"] if post_link_el else None
         
+        time_el = msg.select_one("time")
+        post_date = time_el["datetime"] if time_el and time_el.has_attr("datetime") else ""
+        
         if text_plain and post_link:
             posts.append({
                 "text": text_plain,
@@ -90,13 +93,15 @@ def parse_channel(channel_key):
                 "image_url": img_url,
                 "link": post_link,
                 "channel_name": CHANNELS[channel_key]["name"],
+                "date": post_date,
             })
     
     return posts
 
-def get_all_new_posts():
-    processed = load_processed_hashes()
-    new_posts = []
+def get_all_posts_for_ai():
+    """Собирает последние посты со всех каналов, отсеивает опубликованные."""
+    published = load_processed_hashes()
+    candidates = []
     
     for channel_key in CHANNELS.keys():
         print(f"Парсим канал: {CHANNELS[channel_key]['name']}")
@@ -104,11 +109,14 @@ def get_all_new_posts():
         print(f"  Найдено постов (последние 5): {len(posts)}")
         for post in posts:
             text_hash = get_hash(post["text"])
-            if text_hash not in processed:
+            if text_hash not in published:
                 post["hash"] = text_hash
-                new_posts.append(post)
+                candidates.append(post)
     
-    return new_posts, processed
+    # Сортируем по дате — сначала самые новые
+    candidates.sort(key=lambda p: p.get("date", ""), reverse=True)
+    
+    return candidates, published
 
 def process_with_ai(posts):
     """Отправляет посты в Gemini, чтобы выбрать одну лучшую новость."""
@@ -117,7 +125,7 @@ def process_with_ai(posts):
     
     content_for_ai = ""
     for i, post in enumerate(posts):
-        content_for_ai += f"--- ПОСТ {i+1} ---\n"
+        content_for_ai += f"--- ПОСТ {i+1} (свежесть: {post.get('date', 'неизвестно')}) ---\n"
         content_for_ai += f"Канал: {post['channel_name']}\n"
         content_for_ai += f"Текст: {post['text'][:800]}\n"
         if post['external_links']:
@@ -130,7 +138,8 @@ def process_with_ai(posts):
     Ты — редактор топового технологического Telegram-канала для русскоязычной аудитории.
     Твой стиль — как у Wylsacom и Rozetked: живо, по делу, с лёгкой иронией, но без кликбейта и КАПСА.
 
-    Ниже список постов из нескольких Telegram-каналов.
+    Ниже список постов из нескольких Telegram-каналов. Посты УЖЕ отсортированы по свежести: 
+    Пост 1 — самый свежий, последний — самый старый.
 
     ЭТАП 1 — ОТБОР (отбрось всё, что не подходит):
     - Личные посты: автор делится своим мнением, личными фото/видео, личным опытом.
@@ -140,8 +149,9 @@ def process_with_ai(posts):
 
     ЭТАП 2 — ВЫБОР (очень важно!):
     Из оставшихся выбери РОВНО ОДИН пост.
-    ПРИОРИТЕТ: выбирай посты С КАРТИНКОЙ. Пост без картинки бери ТОЛЬКО если он реально топовый и важный — такое должно случаться редко.
-    Если один пост с картинкой но скучный, а другой без картинки но интересный — всё равно лучше возьми с картинкой, если разница в интересности не критичная.
+    ПРИОРИТЕТ №1: СВЕЖЕСТЬ. Отдавай предпочтение самым новым постам.
+    ПРИОРИТЕТ №2: ПОСТЫ С КАРТИНКОЙ. Пост без картинки бери ТОЛЬКО если он реально топовый.
+    Приоритет №3: Интересность для аудитории (гаджеты, IT, технологии).
 
     ЭТАП 3 — НАПИСАНИЕ ПОСТА:
 
@@ -152,7 +162,7 @@ def process_with_ai(posts):
     - Пустая строка!
     - Абзац 3: детали/подробности, 2-3 предложения.
     - Пустая строка!
-    - Абзац 4 (опционально): вывод или ирония, 1 предложение.
+    - Абзац 4 (опционально): вывод или ирония.
 
     В Telegram перенос строки делается через \\n\\n — ДВА символа переноса между абзацами. Обязательно!
 
@@ -160,33 +170,24 @@ def process_with_ai(posts):
     - Хештеги — НИКОГДА.
     - Упоминания "подробнее на канале X", "читайте на сайте Y", "источник: Z". Мы сами источник!
     - Markdown (звёздочки, подчёркивания). Только HTML.
-    - Слипшийся текст без абзацев. Это выглядит ужасно.
+    - Слипшийся текст без абзацев.
 
     РАЗРЕШЕНО:
     - <b>жирный</b> — 1-3 раза для акцентов.
     - Гиперссылка <a href="URL">текст</a> — ТОЛЬКО если в оригинальном посте есть ссылка на первоисточник (Apple, Google, известный инсайдер).
       Пример: <a href="https://apple.com">Apple</a> представила новый чип M5.
-      Если внешней ссылки в посте нет — НЕ добавляй никаких ссылок вообще.
+      Если внешней ссылки в посте нет — НЕ добавляй никаких ссылок.
 
-    ОБЪЁМ: 400-700 символов. Не больше.
+    ОБЪЁМ: 400-700 символов.
 
     Верни ответ строго в формате JSON:
     {{
-      "post_text": "<b>Короткий цепляющий заголовок</b>\\n\\nПервый абзац текста.\\n\\nВторой абзац.\\n\\nТретий абзац.",
+      "post_text": "<b>Короткий цепляющий заголовок</b>\\n\\nПервый абзац.\\n\\nВторой абзац.\\n\\nТретий абзац.",
       "post_index": номер_выбранного_поста_от_1_до_{len(posts)},
-      "has_image": true,
       "reason": "кратко почему выбрал именно этот пост"
     }}
 
-    ПРИМЕР ХОРОШЕГО ПОСТА:
-    {{
-      "post_text": "<b>Apple ускорила зарядку iPhone 18</b>\\n\\nНовый iPhone 18 Pro Max заряжается до 100% всего за 55 минут. За первые 12 минут он вбирает 52 Вт — это рекорд для линейки.\\n\\nПравда, потом скорость плавно падает, чтобы гаджет не превратился в печку. Похоже, Apple наконец услышала тех, кто вечно куда-то спешит.",
-      "post_index": 3,
-      "has_image": true,
-      "reason": "Свежая новость про зарядку, есть картинка, интересно аудитории"
-    }}
-
-    Вот посты:
+    Вот посты (от самого свежего к самому старому):
     {content_for_ai}
     """
     
@@ -222,7 +223,7 @@ def publish_to_telegram(post_data, all_posts):
     if 0 <= post_index < len(all_posts):
         chosen_post = all_posts[post_index]
         image_url = chosen_post.get("image_url")
-        print(f"Выбранный пост: {chosen_post['channel_name']}, картинка: {'есть' if image_url else 'нет'}")
+        print(f"Выбранный пост: {chosen_post['channel_name']} ({chosen_post.get('date', '')}), картинка: {'есть' if image_url else 'нет'}")
     else:
         print(f"Индекс {post_index} вне диапазона")
         image_url = None
@@ -267,15 +268,20 @@ if __name__ == "__main__":
     print(f"Случайная задержка: {delay} секунд")
     time.sleep(delay)
     
-    new_posts, processed = get_all_new_posts()
-    print(f"Найдено новых постов: {len(new_posts)}")
+    candidates, published = get_all_posts_for_ai()
+    print(f"Найдено кандидатов (неопубликованных): {len(candidates)}")
     
-    if new_posts:
-        result = process_with_ai(new_posts)
-        if result and publish_to_telegram(result, new_posts):
-            for post in new_posts:
-                processed.add(post["hash"])
-            save_processed_hashes(processed)
-            print("История обновлена.")
+    if not candidates:
+        print("Все посты из последних 5 в каждом канале уже опубликованы. Пропускаем.")
     else:
-        print("Новых постов нет, публикация не требуется.")
+        result = process_with_ai(candidates)
+        if result:
+            post_index = result.get("post_index", 1) - 1
+            if 0 <= post_index < len(candidates):
+                chosen = candidates[post_index]
+                if publish_to_telegram(result, candidates):
+                    # Помечаем как опубликованный ТОЛЬКО выбранный пост
+                    published.add(chosen["hash"])
+                    save_processed_hashes(published)
+                    print(f"Помечен как опубликованный: {chosen['channel_name']}")
+                    print("История обновлена.")
