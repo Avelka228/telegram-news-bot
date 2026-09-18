@@ -19,8 +19,8 @@ RSS_FEEDS = [
 
 # --- Настройка Gemini (новый SDK) ---
 client = genai.Client(api_key=GOOGLE_API_KEY)
-# Используем именно ту модель, которую вы просили
-MODEL_ID = "gemini-2.5-flash-lite"
+# Модель, которую подсказал сам Google в ошибке
+MODEL_ID = "gemini-3.5-flash-lite"
 
 def get_news_from_rss():
     """Собирает заголовки и ссылки из RSS-лент."""
