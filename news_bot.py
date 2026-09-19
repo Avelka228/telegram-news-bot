@@ -36,23 +36,62 @@ processed_file = "processed_posts.json"
 # Минимальный интервал между публикациями (в минутах)
 MIN_INTERVAL_MINUTES = 30
 
+# Сколько дней хранить историю публикаций
+HISTORY_DAYS = 3
+
 
 def load_data():
-    """Загружает хеши обработанных постов и время последней публикации."""
+    """Загружает хеши постов, хеши картинок, историю публикаций."""
     if os.path.exists(processed_file):
         with open(processed_file, "r") as f:
-            data = json.load(f)
-            # Поддержка старого формата (просто список хешей)
-            if isinstance(data, list):
-                return set(data), None
-            return set(data.get("hashes", [])), data.get("last_publish")
-    return set(), None
+            try:
+                data = json.load(f)
+            except Exception:
+                return set(), set(), [], None
+        
+        # Поддержка старого формата (просто список хешей)
+        if isinstance(data, list):
+            return set(data), set(), [], None
+        
+        return (
+            set(data.get("hashes", [])),
+            set(data.get("image_hashes", [])),
+            data.get("history", []),
+            data.get("last_publish")
+        )
+    return set(), set(), [], None
 
 
-def save_data(hashes, last_publish=None):
-    """Сохраняет хеши и время последней публикации."""
+def save_data(hashes, image_hashes, history, last_publish=None):
+    """Сохраняет всё состояние в файл."""
+    # Чистим старые записи (старше HISTORY_DAYS дней)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
+    cleaned_history = []
+    for item in history:
+        try:
+            item_date = datetime.fromisoformat(item.get("date", ""))
+            if item_date.tzinfo is None:
+                item_date = item_date.replace(tzinfo=timezone.utc)
+            if item_date > cutoff:
+                cleaned_history.append(item)
+        except Exception:
+            # Если дата некорректная — оставляем запись на всякий случай
+            cleaned_history.append(item)
+    
+    # Чистим хеши картинок, которых уже нет в истории
+    active_image_hashes = set()
+    for item in cleaned_history:
+        if "image_hash" in item:
+            active_image_hashes.add(item["image_hash"])
+    
+    # Оставляем только те хеши картинок, что в активной истории
+    # (но также сохраняем те, что не привязаны к истории — на случай старых записей)
+    final_image_hashes = image_hashes & active_image_hashes if active_image_hashes else image_hashes
+    
     data = {
         "hashes": list(hashes),
+        "image_hashes": list(final_image_hashes),
+        "history": cleaned_history,
         "last_publish": last_publish
     }
     with open(processed_file, "w") as f:
@@ -134,6 +173,7 @@ def parse_channel(channel_key):
                 "text": text_plain,
                 "external_links": external_links,
                 "image_url": img_url,
+                "image_hash": get_hash(img_url) if img_url else None,
                 "link": post_link,
                 "channel_name": CHANNELS[channel_key]["name"],
                 "date": post_date,
@@ -144,8 +184,9 @@ def parse_channel(channel_key):
 
 def get_all_posts_for_ai():
     """Собирает последние посты со всех каналов, отсеивает опубликованные."""
-    published, last_publish = load_data()
+    published, image_hashes, history, last_publish = load_data()
     candidates = []
+    skipped_by_image = 0
     
     for channel_key in CHANNELS.keys():
         print(f"Парсим канал: {CHANNELS[channel_key]['name']}")
@@ -153,16 +194,29 @@ def get_all_posts_for_ai():
         print(f"  Найдено постов (последние 5): {len(posts)}")
         for post in posts:
             text_hash = get_hash(post["text"])
-            if text_hash not in published:
-                post["hash"] = text_hash
-                candidates.append(post)
+            
+            # Пропускаем по тексту
+            if text_hash in published:
+                continue
+            
+            # Пропускаем по картинке (если та же картинка уже была)
+            if post.get("image_hash") and post["image_hash"] in image_hashes:
+                skipped_by_image += 1
+                print(f"  ⏭️ Пропускаем пост из {post['channel_name']} — картинка уже была")
+                continue
+            
+            post["hash"] = text_hash
+            candidates.append(post)
+    
+    if skipped_by_image:
+        print(f"Всего пропущено по картинке: {skipped_by_image}")
     
     candidates.sort(key=lambda p: p.get("date", ""), reverse=True)
     
-    return candidates, published, last_publish
+    return candidates, published, image_hashes, history, last_publish
 
 
-def process_with_ai(posts):
+def process_with_ai(posts, history):
     """Отправляет посты в Gemini, чтобы выбрать одну лучшую новость."""
     if not posts:
         return None
@@ -178,6 +232,14 @@ def process_with_ai(posts):
                 content_for_ai += f"  - URL: {link['url']} (текст: '{link['anchor']}')\n"
         content_for_ai += f"Есть картинка: {'да' if post['image_url'] else 'НЕТ'}\n\n"
     
+    # Формируем список недавних публикаций для проверки на дубли
+    recent_published = ""
+    if history:
+        recent_published = "УЖЕ ОПУБЛИКОВАНО ЗА ПОСЛЕДНИЕ ДНИ (НЕ БРАТЬ ПОВТОРЫ):\n"
+        for item in history[-30:]:
+            recent_published += f"- {item.get('summary', '')}\n"
+        recent_published += "\n"
+    
     prompt = f"""
     Ты — редактор топового технологического Telegram-канала для русскоязычной аудитории.
     Твой стиль — как у Wylsacom и Rozetked: живо, по делу, с лёгкой иронией, но без кликбейта и КАПСА.
@@ -185,11 +247,14 @@ def process_with_ai(posts):
     Ниже список постов из нескольких Telegram-каналов. Посты УЖЕ отсортированы по свежести: 
     Пост 1 — самый свежий, последний — самый старый.
 
+    {recent_published}
+
     ЭТАП 1 — ОТБОР (отбрось всё, что не подходит):
     - Личные посты: автор делится своим мнением, личными фото/видео, личным опытом.
     - Реклама, спонсорские посты, промокоды, интеграции.
     - Опросы, мемы без новостной ценности, поздравления, "просто поболтать".
     - Посты без новостной ценности (например, "смотрите какой закат").
+    - НОВОСТИ, КОТОРЫЕ УЖЕ ЕСТЬ В СПИСКЕ "УЖЕ ОПУБЛИКОВАНО" ВЫШЕ. Если новость похожа по смыслу — пропусти!
 
     ЭТАП 2 — ВЫБОР (очень важно!):
     Из оставшихся выбери РОВНО ОДИН пост.
@@ -228,7 +293,14 @@ def process_with_ai(posts):
     {{
       "post_text": "<b>Короткий цепляющий заголовок</b>\\n\\nПервый абзац.\\n\\nВторой абзац.\\n\\nТретий абзац.",
       "post_index": номер_выбранного_поста_от_1_до_{len(posts)},
+      "summary": "краткое описание новости в 10-15 слов (для проверки на дубли в будущем)",
       "reason": "кратко почему выбрал именно этот пост"
+    }}
+
+    Если ВСЕ посты являются дублями уже опубликованных — верни:
+    {{
+      "post_index": 0,
+      "reason": "все посты — дубли"
     }}
 
     Вот посты (от самого свежего к самому старому):
@@ -314,26 +386,43 @@ if __name__ == "__main__":
     print(f"Случайная задержка: {delay} секунд")
     time.sleep(delay)
     
-    # Проверяем, не было ли недавно публикации
-    _, last_publish = load_data()
+    # Проверяем интервал
+    _, _, _, last_publish = load_data()
     if should_skip_due_to_interval(last_publish):
         print("Пропускаем запуск из-за недавней публикации.")
     else:
-        candidates, published, _ = get_all_posts_for_ai()
+        candidates, published, image_hashes, history, _ = get_all_posts_for_ai()
         print(f"Найдено кандидатов (неопубликованных): {len(candidates)}")
         
         if not candidates:
             print("Все посты из последних 5 в каждом канале уже опубликованы. Пропускаем.")
         else:
-            result = process_with_ai(candidates)
-            if result:
+            result = process_with_ai(candidates, history)
+            
+            # Если AI вернул 0 — все дубли
+            if not result or result.get("post_index", 0) == 0:
+                print("AI не нашёл новых интересных новостей (все дубли). Пропускаем.")
+            else:
                 post_index = result.get("post_index", 1) - 1
                 if 0 <= post_index < len(candidates):
                     chosen = candidates[post_index]
                     if publish_to_telegram(result, candidates):
+                        # Сохраняем хеш текста
                         published.add(chosen["hash"])
-                        # Сохраняем время публикации в UTC
+                        
+                        # Сохраняем хеш картинки
+                        if chosen.get("image_hash"):
+                            image_hashes.add(chosen["image_hash"])
+                        
+                        # Добавляем запись в историю
                         now_utc = datetime.now(timezone.utc).isoformat()
-                        save_data(published, now_utc)
-                        print(f"Помечен как опубликованный: {chosen['channel_name']}")
-                        print(f"История обновлена. Время публикации: {now_utc}")
+                        history.append({
+                            "date": now_utc,
+                            "summary": result.get("summary", "")[:200],
+                            "image_hash": chosen.get("image_hash"),
+                            "channel": chosen["channel_name"]
+                        })
+                        
+                        save_data(published, image_hashes, history, now_utc)
+                        print(f"Опубликовано из канала: {chosen['channel_name']}")
+                        print(f"История обновлена. Время: {now_utc}")
