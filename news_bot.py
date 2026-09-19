@@ -33,26 +33,19 @@ MODEL_ID = "gemini-3.5-flash-lite"
 
 processed_file = "processed_posts.json"
 
-# Минимальный интервал между публикациями (в минутах)
-MIN_INTERVAL_MINUTES = 30
-
-# Сколько дней хранить историю публикаций
+MIN_INTERVAL_MINUTES = 90
 HISTORY_DAYS = 3
 
 
 def load_data():
-    """Загружает хеши постов, хеши картинок, историю публикаций."""
     if os.path.exists(processed_file):
         with open(processed_file, "r") as f:
             try:
                 data = json.load(f)
             except Exception:
                 return set(), set(), [], None
-        
-        # Поддержка старого формата (просто список хешей)
         if isinstance(data, list):
             return set(data), set(), [], None
-        
         return (
             set(data.get("hashes", [])),
             set(data.get("image_hashes", [])),
@@ -63,8 +56,6 @@ def load_data():
 
 
 def save_data(hashes, image_hashes, history, last_publish=None):
-    """Сохраняет всё состояние в файл."""
-    # Чистим старые записи (старше HISTORY_DAYS дней)
     cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
     cleaned_history = []
     for item in history:
@@ -75,17 +66,13 @@ def save_data(hashes, image_hashes, history, last_publish=None):
             if item_date > cutoff:
                 cleaned_history.append(item)
         except Exception:
-            # Если дата некорректная — оставляем запись на всякий случай
             cleaned_history.append(item)
     
-    # Чистим хеши картинок, которых уже нет в истории
     active_image_hashes = set()
     for item in cleaned_history:
         if "image_hash" in item:
             active_image_hashes.add(item["image_hash"])
     
-    # Оставляем только те хеши картинок, что в активной истории
-    # (но также сохраняем те, что не привязаны к истории — на случай старых записей)
     final_image_hashes = image_hashes & active_image_hashes if active_image_hashes else image_hashes
     
     data = {
@@ -103,18 +90,14 @@ def get_hash(text):
 
 
 def should_skip_due_to_interval(last_publish_str):
-    """Проверяет, не было ли публикации за последние MIN_INTERVAL_MINUTES минут."""
     if not last_publish_str:
         return False
-    
     try:
         last_publish = datetime.fromisoformat(last_publish_str)
         if last_publish.tzinfo is None:
             last_publish = last_publish.replace(tzinfo=timezone.utc)
-        
         now = datetime.now(timezone.utc)
         diff_minutes = (now - last_publish).total_seconds() / 60
-        
         if diff_minutes < MIN_INTERVAL_MINUTES:
             print(f"⚠️ Прошло всего {diff_minutes:.1f} мин с прошлой публикации. Пропускаем.")
             return True
@@ -125,10 +108,8 @@ def should_skip_due_to_interval(last_publish_str):
 
 
 def parse_channel(channel_key):
-    """Парсит веб-версию канала и возвращает 5 последних постов."""
     url = f"https://t.me/s/{channel_key}"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
-    
     try:
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
@@ -138,14 +119,12 @@ def parse_channel(channel_key):
 
     soup = BeautifulSoup(resp.text, "html.parser")
     posts = []
-    
     message_divs = soup.select("div.tgme_widget_message_wrap")
     
     for msg in message_divs[-5:]:
         text_el = msg.select_one(".tgme_widget_message_text")
         if not text_el:
             continue
-        
         text_plain = text_el.get_text(" ", strip=True)
         
         external_links = []
@@ -178,12 +157,10 @@ def parse_channel(channel_key):
                 "channel_name": CHANNELS[channel_key]["name"],
                 "date": post_date,
             })
-    
     return posts
 
 
 def get_all_posts_for_ai():
-    """Собирает последние посты со всех каналов, отсеивает опубликованные."""
     published, image_hashes, history, last_publish = load_data()
     candidates = []
     skipped_by_image = 0
@@ -194,17 +171,12 @@ def get_all_posts_for_ai():
         print(f"  Найдено постов (последние 5): {len(posts)}")
         for post in posts:
             text_hash = get_hash(post["text"])
-            
-            # Пропускаем по тексту
             if text_hash in published:
                 continue
-            
-            # Пропускаем по картинке (если та же картинка уже была)
             if post.get("image_hash") and post["image_hash"] in image_hashes:
                 skipped_by_image += 1
                 print(f"  ⏭️ Пропускаем пост из {post['channel_name']} — картинка уже была")
                 continue
-            
             post["hash"] = text_hash
             candidates.append(post)
     
@@ -212,12 +184,10 @@ def get_all_posts_for_ai():
         print(f"Всего пропущено по картинке: {skipped_by_image}")
     
     candidates.sort(key=lambda p: p.get("date", ""), reverse=True)
-    
     return candidates, published, image_hashes, history, last_publish
 
 
 def process_with_ai(posts, history):
-    """Отправляет посты в Gemini, чтобы выбрать одну лучшую новость."""
     if not posts:
         return None
     
@@ -232,7 +202,6 @@ def process_with_ai(posts, history):
                 content_for_ai += f"  - URL: {link['url']} (текст: '{link['anchor']}')\n"
         content_for_ai += f"Есть картинка: {'да' if post['image_url'] else 'НЕТ'}\n\n"
     
-    # Формируем список недавних публикаций для проверки на дубли
     recent_published = ""
     if history:
         recent_published = "УЖЕ ОПУБЛИКОВАНО ЗА ПОСЛЕДНИЕ ДНИ (НЕ БРАТЬ ПОВТОРЫ):\n"
@@ -249,22 +218,71 @@ def process_with_ai(posts, history):
 
     {recent_published}
 
-    ЭТАП 1 — ОТБОР (отбрось всё, что не подходит):
-    - Личные посты: автор делится своим мнением, личными фото/видео, личным опытом.
-    - Реклама, спонсорские посты, промокоды, интеграции.
-    - Опросы, мемы без новостной ценности, поздравления, "просто поболтать".
-    - Посты без новостной ценности (например, "смотрите какой закат").
-    - НОВОСТИ, КОТОРЫЕ УЖЕ ЕСТЬ В СПИСКЕ "УЖЕ ОПУБЛИКОВАНО" ВЫШЕ. Если новость похожа по смыслу — пропусти!
+    ═══════════════════════════════════════════════════
+    ЭТАП 1 — ОТБРОСИТЬ МУСОР (это точно НЕ публикуем):
+    ═══════════════════════════════════════════════════
 
-    ЭТАП 2 — ВЫБОР (очень важно!):
-    Из оставшихся выбери РОВНО ОДИН пост.
-    ПРИОРИТЕТ №1: СВЕЖЕСТЬ. Отдавай предпочтение самым новым постам.
-    ПРИОРИТЕТ №2: ПОСТЫ С КАРТИНКОЙ. Пост без картинки бери ТОЛЬКО если он реально топовый.
-    Приоритет №3: Интересность для аудитории (гаджеты, IT, технологии).
+    ❌ РЕКЛАМА И ПРОМО (отбрасываем ВСЕГДА):
+    - Промокоды, скидки, "купи по ссылке", "используй код"
+    - Партнёрские материалы, интеграции, спонсорские посты
+    - "Розыгрыш", "конкурс", "подпишись и получи"
+    - Реферальные ссылки, реклама магазинов и сервисов
+    - Посты с явной коммерческой целью
 
+    ❌ ЛИЧНОЕ (отбрасываем):
+    - Мнение автора, личный опыт, "я попробовал"
+    - Личные фото/видео автора, "смотрите какой закат"
+    - Поздравления, "с добрым утром", мемы без смысла
+    - Опросы, "а вы как думаете?"
+
+    ❌ ДУБЛИ (отбрасываем):
+    - Всё, что похоже по смыслу на список "УЖЕ ОПУБЛИКОВАНО" выше
+
+    ═══════════════════════════════════════════════════
+    ЭТАП 2 — ВЫБРАТЬ ЛУЧШЕЕ ИЗ ОСТАВШЕГОСЯ:
+    ═══════════════════════════════════════════════════
+
+    После отброса мусора у тебя остались нормальные новости. 
+    Оцени их и выбери САМУЮ ИНТЕРЕСНУЮ по такой шкале:
+
+    🥇 ТОП-НОВОСТИ (приоритет):
+    - Новые продукты и устройства (Samsung Galaxy S26, iPhone 18)
+    - Крупные анонсы и утечки флагманов
+    - Скандалы, суды, блокировки в IT
+    - Прорывы в науке и технологиях (новые чипы, ИИ, квантовые компьютеры)
+    - Крупные сделки, поглощения
+    - Уход/приход топ-менеджеров крупных компаний
+
+    🥈 СРЕДНИЕ:
+    - Обзоры новых устройств
+    - Важные обновления популярных сервисов
+    - Интересные исследования и статистика
+
+    🥉 МЕЛКИЕ (берём, если нет топовых и средних):
+    - Мелкие обновления приложений
+    - Второстепенные функции
+    - Любая другая реальная новость
+
+    ⚠️ ВАЖНО: Мелочь — это ВСЁ РАВНО НОВОСТЬ. Лучше опубликовать её, чем ничего.
+    НЕ пропускай запуск, если есть хоть одна реальная новость. 
+
+    Пропустить запуск (post_index: 0) можно ТОЛЬКО если:
+    - ВСЕ посты — реклама/промо, ИЛИ
+    - ВСЕ посты — личные/мемы/опросы, ИЛИ
+    - ВСЕ посты — дубли уже опубликованного, ИЛИ
+    - Список постов вообще пуст.
+
+    Если осталась ХОТЬ ОДНА реальная новость — бери её. Даже если она мелкая.
+
+    ПРИОРИТЕТЫ ПРИ ВЫБОРЕ:
+    1. Значимость (топ > среднее > мелочь)
+    2. Свежесть
+    3. Наличие картинки
+
+    ═══════════════════════════════════════════════════
     ЭТАП 3 — НАПИСАНИЕ ПОСТА:
-
-    СТРУКТУРА (обязательно соблюдай!):
+    ═══════════════════════════════════════════════════
+    СТРУКТУРА (обязательно):
     - Абзац 1: КОРОТКИЙ цепляющий хук, до 60 символов, выделен <b>жирным</b>.
     - Пустая строка между всеми абзацами!
     - Абзац 2: суть новости, 1-2 предложения.
@@ -273,37 +291,37 @@ def process_with_ai(posts, history):
     - Пустая строка!
     - Абзац 4 (опционально): вывод или ирония.
 
-    В Telegram перенос строки делается через \\n\\n — ДВА символа переноса между абзацами. Обязательно!
+    В Telegram перенос строки делается через \\n\\n — ДВА символа переноса.
 
     ЗАПРЕЩЕНО:
-    - Хештеги — НИКОГДА.
-    - Упоминания "подробнее на канале X", "читайте на сайте Y", "источник: Z". Мы сами источник!
-    - Markdown (звёздочки, подчёркивания). Только HTML.
+    - Хештеги.
+    - Упоминания "подробнее на канале X", "читайте на сайте Y", "источник: Z".
+    - Markdown. Только HTML.
     - Слипшийся текст без абзацев.
 
     РАЗРЕШЕНО:
-    - <b>жирный</b> — 1-3 раза для акцентов.
-    - Гиперссылка <a href="URL">текст</a> — ТОЛЬКО если в оригинальном посте есть ссылка на первоисточник (Apple, Google, известный инсайдер).
-      Пример: <a href="https://apple.com">Apple</a> представила новый чип M5.
-      Если внешней ссылки в посте нет — НЕ добавляй никаких ссылок.
+    - <b>жирный</b> — 1-3 раза.
+    - Гиперссылка <a href="URL">текст</a> — ТОЛЬКО если в оригинальном посте есть ссылка на первоисточник.
 
     ОБЪЁМ: 400-700 символов.
 
-    Верни ответ строго в формате JSON:
+    ═══════════════════════════════════════════════════
+    ФОРМАТ ОТВЕТА (строго JSON):
+    ═══════════════════════════════════════════════════
     {{
-      "post_text": "<b>Короткий цепляющий заголовок</b>\\n\\nПервый абзац.\\n\\nВторой абзац.\\n\\nТретий абзац.",
-      "post_index": номер_выбранного_поста_от_1_до_{len(posts)},
-      "summary": "краткое описание новости в 10-15 слов (для проверки на дубли в будущем)",
-      "reason": "кратко почему выбрал именно этот пост"
+      "post_text": "<b>Заголовок</b>\\n\\nАбзац 1.\\n\\nАбзац 2.\\n\\nАбзац 3.",
+      "post_index": номер_от_1_до_{len(posts)},
+      "summary": "краткое описание новости в 10-15 слов",
+      "reason": "почему выбрал именно этот пост"
     }}
 
-    Если ВСЕ посты являются дублями уже опубликованных — верни:
+    ТОЛЬКО если ВСЁ — мусор (реклама/личное/дубли), верни:
     {{
       "post_index": 0,
-      "reason": "все посты — дубли"
+      "reason": "нет реальных новостей"
     }}
 
-    Вот посты (от самого свежего к самому старому):
+    Вот посты:
     {content_for_ai}
     """
     
@@ -329,7 +347,6 @@ def process_with_ai(posts, history):
 
 
 def publish_to_telegram(post_data, all_posts):
-    """Публикует пост с картинкой (или без) в Telegram-канал."""
     if not post_data or not post_data.get("post_text"):
         print("Нет данных для публикации.")
         return False
@@ -386,7 +403,6 @@ if __name__ == "__main__":
     print(f"Случайная задержка: {delay} секунд")
     time.sleep(delay)
     
-    # Проверяем интервал
     _, _, _, last_publish = load_data()
     if should_skip_due_to_interval(last_publish):
         print("Пропускаем запуск из-за недавней публикации.")
@@ -399,22 +415,18 @@ if __name__ == "__main__":
         else:
             result = process_with_ai(candidates, history)
             
-            # Если AI вернул 0 — все дубли
             if not result or result.get("post_index", 0) == 0:
-                print("AI не нашёл новых интересных новостей (все дубли). Пропускаем.")
+                print("AI не нашёл реальных новостей (только реклама/личное/дубли). Пропускаем.")
             else:
                 post_index = result.get("post_index", 1) - 1
                 if 0 <= post_index < len(candidates):
                     chosen = candidates[post_index]
                     if publish_to_telegram(result, candidates):
-                        # Сохраняем хеш текста
                         published.add(chosen["hash"])
                         
-                        # Сохраняем хеш картинки
                         if chosen.get("image_hash"):
                             image_hashes.add(chosen["image_hash"])
                         
-                        # Добавляем запись в историю
                         now_utc = datetime.now(timezone.utc).isoformat()
                         history.append({
                             "date": now_utc,
