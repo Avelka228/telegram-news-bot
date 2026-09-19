@@ -7,7 +7,7 @@ import time
 import random
 from bs4 import BeautifulSoup
 from google import genai
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # --- Конфигурация ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -21,6 +21,10 @@ CHANNELS = {
     "Romancev768":   {"name": "Romancev768",  "url": "https://t.me/Romancev768"},
     "biggeekru":     {"name": "Big Geek",     "url": "https://t.me/biggeekru"},
     "iphonesru":     {"name": "iPhones.ru",   "url": "https://t.me/iphonesru"},
+    "technomedia":   {"name": "Техночат",     "url": "https://t.me/technomedia"},
+    "naebnet":       {"name": "NN",           "url": "https://t.me/naebnet"},
+    "rozetked":      {"name": "Rozetked",     "url": "https://t.me/rozetked"},
+    "typespace":     {"name": "Тайпспейс",    "url": "https://t.me/typespace"},
 }
 
 # --- Настройка Gemini ---
@@ -29,18 +33,57 @@ MODEL_ID = "gemini-3.5-flash-lite"
 
 processed_file = "processed_posts.json"
 
-def load_processed_hashes():
+# Минимальный интервал между публикациями (в минутах)
+MIN_INTERVAL_MINUTES = 30
+
+
+def load_data():
+    """Загружает хеши обработанных постов и время последней публикации."""
     if os.path.exists(processed_file):
         with open(processed_file, "r") as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+            # Поддержка старого формата (просто список хешей)
+            if isinstance(data, list):
+                return set(data), None
+            return set(data.get("hashes", [])), data.get("last_publish")
+    return set(), None
 
-def save_processed_hashes(hashes):
+
+def save_data(hashes, last_publish=None):
+    """Сохраняет хеши и время последней публикации."""
+    data = {
+        "hashes": list(hashes),
+        "last_publish": last_publish
+    }
     with open(processed_file, "w") as f:
-        json.dump(list(hashes), f)
+        json.dump(data, f)
+
 
 def get_hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def should_skip_due_to_interval(last_publish_str):
+    """Проверяет, не было ли публикации за последние MIN_INTERVAL_MINUTES минут."""
+    if not last_publish_str:
+        return False
+    
+    try:
+        last_publish = datetime.fromisoformat(last_publish_str)
+        if last_publish.tzinfo is None:
+            last_publish = last_publish.replace(tzinfo=timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        diff_minutes = (now - last_publish).total_seconds() / 60
+        
+        if diff_minutes < MIN_INTERVAL_MINUTES:
+            print(f"⚠️ Прошло всего {diff_minutes:.1f} мин с прошлой публикации. Пропускаем.")
+            return True
+        return False
+    except Exception as e:
+        print(f"Ошибка при проверке времени: {e}")
+        return False
+
 
 def parse_channel(channel_key):
     """Парсит веб-версию канала и возвращает 5 последних постов."""
@@ -98,9 +141,10 @@ def parse_channel(channel_key):
     
     return posts
 
+
 def get_all_posts_for_ai():
     """Собирает последние посты со всех каналов, отсеивает опубликованные."""
-    published = load_processed_hashes()
+    published, last_publish = load_data()
     candidates = []
     
     for channel_key in CHANNELS.keys():
@@ -113,10 +157,10 @@ def get_all_posts_for_ai():
                 post["hash"] = text_hash
                 candidates.append(post)
     
-    # Сортируем по дате — сначала самые новые
     candidates.sort(key=lambda p: p.get("date", ""), reverse=True)
     
-    return candidates, published
+    return candidates, published, last_publish
+
 
 def process_with_ai(posts):
     """Отправляет посты в Gemini, чтобы выбрать одну лучшую новость."""
@@ -211,6 +255,7 @@ def process_with_ai(posts):
         print(f"Сырой ответ: {response.text if response is not None else 'нет'}")
         return None
 
+
 def publish_to_telegram(post_data, all_posts):
     """Публикует пост с картинкой (или без) в Telegram-канал."""
     if not post_data or not post_data.get("post_text"):
@@ -223,7 +268,7 @@ def publish_to_telegram(post_data, all_posts):
     if 0 <= post_index < len(all_posts):
         chosen_post = all_posts[post_index]
         image_url = chosen_post.get("image_url")
-        print(f"Выбранный пост: {chosen_post['channel_name']} ({chosen_post.get('date', '')}), картинка: {'есть' if image_url else 'нет'}")
+        print(f"Выбранный пост: {chosen_post['channel_name']}, картинка: {'есть' if image_url else 'нет'}")
     else:
         print(f"Индекс {post_index} вне диапазона")
         image_url = None
@@ -261,6 +306,7 @@ def publish_to_telegram(post_data, all_posts):
         print(f"Ответ: {response.text if response is not None else 'нет ответа'}")
         return False
 
+
 if __name__ == "__main__":
     print(f"Запуск бота: {datetime.now()}")
     
@@ -268,20 +314,26 @@ if __name__ == "__main__":
     print(f"Случайная задержка: {delay} секунд")
     time.sleep(delay)
     
-    candidates, published = get_all_posts_for_ai()
-    print(f"Найдено кандидатов (неопубликованных): {len(candidates)}")
-    
-    if not candidates:
-        print("Все посты из последних 5 в каждом канале уже опубликованы. Пропускаем.")
+    # Проверяем, не было ли недавно публикации
+    _, last_publish = load_data()
+    if should_skip_due_to_interval(last_publish):
+        print("Пропускаем запуск из-за недавней публикации.")
     else:
-        result = process_with_ai(candidates)
-        if result:
-            post_index = result.get("post_index", 1) - 1
-            if 0 <= post_index < len(candidates):
-                chosen = candidates[post_index]
-                if publish_to_telegram(result, candidates):
-                    # Помечаем как опубликованный ТОЛЬКО выбранный пост
-                    published.add(chosen["hash"])
-                    save_processed_hashes(published)
-                    print(f"Помечен как опубликованный: {chosen['channel_name']}")
-                    print("История обновлена.")
+        candidates, published, _ = get_all_posts_for_ai()
+        print(f"Найдено кандидатов (неопубликованных): {len(candidates)}")
+        
+        if not candidates:
+            print("Все посты из последних 5 в каждом канале уже опубликованы. Пропускаем.")
+        else:
+            result = process_with_ai(candidates)
+            if result:
+                post_index = result.get("post_index", 1) - 1
+                if 0 <= post_index < len(candidates):
+                    chosen = candidates[post_index]
+                    if publish_to_telegram(result, candidates):
+                        published.add(chosen["hash"])
+                        # Сохраняем время публикации в UTC
+                        now_utc = datetime.now(timezone.utc).isoformat()
+                        save_data(published, now_utc)
+                        print(f"Помечен как опубликованный: {chosen['channel_name']}")
+                        print(f"История обновлена. Время публикации: {now_utc}")
